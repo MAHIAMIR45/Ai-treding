@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: ai-trading-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
@@ -9,3 +9,4 @@ services:
         sync: false
       - key: PYTHON_VERSION
         value: 3.11.0
+        
