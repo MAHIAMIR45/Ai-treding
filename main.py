@@ -7,10 +7,28 @@ from datetime import datetime
 from flask import Flask, render_template_string, jsonify
 
 # ========================= CONFIG =========================
-TELEGRAM_BOT_TOKEN = "6253228355:AAEkmteKAFnFoe-m0HauSYGouYN0m5MDZjM"
-TELEGRAM_CHAT_ID = "aadi00bot"
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL = "compound-beta"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "aadi00bot")
+
+# Multiple Groq API keys — loaded from environment
+_RAW_KEYS = [
+    os.environ.get("GROQ_API_KEY", ""),
+    os.environ.get("GROQ_API_KEY_2", ""),
+    os.environ.get("GROQ_API_KEY_3", ""),
+]
+GROQ_KEYS = [k for k in _RAW_KEYS if k.strip()]
+
+# All Groq models to try per key (fastest/best first)
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "mixtral-8x7b-32768",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+]
+
+# Flat rotation list: every (key, model) combination
+GROQ_SLOTS = [(key, model) for key in GROQ_KEYS for model in GROQ_MODELS]
 
 # Simulation Settings
 INITIAL_BALANCE_USD = 20.0
@@ -21,19 +39,19 @@ SL_PERCENT = 7.0
 CHECK_INTERVAL = 120
 MAX_POSITIONS = 1
 
-# 12-Point Confirmation Thresholds
-MIN_LIQUIDITY = 30000
-MIN_5M_VOLUME = 5000
-MIN_1H_VOLUME = 15000
-MIN_BUY_RATIO_5M = 1.5
-MIN_BUY_RATIO_1H = 1.2
-MAX_MC = 3000000
+# 12-Point Confirmation Thresholds (relaxed to actually find tokens)
+MIN_LIQUIDITY = 8000
+MIN_5M_VOLUME = 1000
+MIN_1H_VOLUME = 5000
+MIN_BUY_RATIO_5M = 1.3
+MIN_BUY_RATIO_1H = 1.1
+MAX_MC = 5000000
 MIN_LP_LOCKED_PCT = 50
-MIN_PRICE_CHANGE_5M = 0.5
-MAX_PRICE_CHANGE_5M = 50.0
-MAX_PRICE_CHANGE_1H = 150.0
-MIN_PRICE_CHANGE_1H = -10.0
-MIN_VOLUME_MCAP_RATIO = 0.01
+MIN_PRICE_CHANGE_5M = 0.3
+MAX_PRICE_CHANGE_5M = 60.0
+MAX_PRICE_CHANGE_1H = 200.0
+MIN_PRICE_CHANGE_1H = -15.0
+MIN_VOLUME_MCAP_RATIO = 0.005
 
 # Web server port
 PORT = int(os.environ.get("PORT", 5000))
@@ -518,7 +536,7 @@ def cmd_start(chat_id):
     send_telegram(f"""🤖 <b>AI TRADING BOT — ACTIVE</b>
 ━━━━━━━━━━━━━━━━━━━━
 Solana meme coin paper trading bot.
-AI (Groq {GROQ_MODEL}) decide karta hai kab buy/sell karna hai.
+AI (Groq llama-3.3-70b-versatile + {len(GROQ_KEYS)} keys) decide karta hai kab buy/sell karna hai.
 
 <b>Available Commands:</b>
 /start — Welcome message
@@ -726,11 +744,13 @@ def command_listener():
 
 # ==================== AI BRAIN (UPGRADED) ====================
 
-def ask_ai_brain(token_data: dict) -> dict:
-    if not GROQ_API_KEY:
-        return {"decision": "SKIP", "confidence": 0, "reason": "No Groq API key"}
+# Track AI status so we only send one Telegram alert per outage
+_ai_down = False
+_ai_down_notified = False
 
-    prompt = f"""You are an expert Solana meme coin trader with deep knowledge of on-chain analytics and pump patterns. Analyze this token for a SHORT-TERM paper trade with 20% take profit and 7% stop loss.
+
+def _build_prompt(token_data: dict) -> str:
+    return f"""You are an expert Solana meme coin trader. Analyze this token for a SHORT-TERM paper trade (TP +20%, SL -7%).
 
 TOKEN METRICS:
 - Symbol: {token_data.get('symbol')}
@@ -739,73 +759,125 @@ TOKEN METRICS:
 - Liquidity: ${token_data.get('liquidity', 0):,.0f}
 - 5min Volume: ${token_data.get('vol_5m', 0):,.0f}
 - 1hr Volume: ${token_data.get('vol_1h', 0):,.0f}
-- 24hr Volume: ${token_data.get('vol_24h', 0):,.0f}
 - Buy/Sell Ratio 5m: {token_data.get('buy_ratio_5m', 0):.2f}x
 - Buy/Sell Ratio 1h: {token_data.get('buy_ratio_1h', 0):.2f}x
 - Price Change 5m: {token_data.get('price_change_5m', 0):.2f}%
 - Price Change 1h: {token_data.get('price_change_1h', 0):.2f}%
-- Price Change 24h: {token_data.get('price_change_24h', 0):.2f}%
 - LP Locked: {token_data.get('lp_locked', 0):.1f}%
 - Mint Revoked: {token_data.get('mint_revoked', False)}
-- Volume/MC Ratio: {token_data.get('vol_mc_ratio', 0):.4f}
-- 5min Buys: {token_data.get('buys_5m', 0)}
 - Confirmations: {token_data.get('confirmations_passed', 0)}/12
 
-STRICT ANALYSIS CRITERIA — Only BUY if ALL of these are true:
-1. MOMENTUM: Price change 5m is positive and between 2%-40% (early pump, not already dumped)
-2. VOLUME STRENGTH: 5min volume is at least 2x the average (strong buying interest)
-3. BUY PRESSURE: Buy/sell ratio 5m >= 2.0 (strong buyers dominating)
-4. SAFETY: LP locked >= 50% OR mint revoked (not a rug pull risk)
-5. LIQUIDITY: Sufficient liquidity for our trade size without major slippage
-6. MARKET CAP STAGE: MC < $2M (early stage token with room to 20% gain)
-7. NOT OVEREXTENDED: 1h price change < 100% (not already pumped out)
-8. REALISTIC TP: Can realistically hit +20% based on current momentum
+BUY if: price moving up, buy ratio >= 1.3, MC < $5M, not already pumped >150% in 1h.
+SKIP if: sellers dominating (BR < 1.0), already pumped >180% in 1h, liquidity < $5K.
+This is paper trading — take calculated risks. Give BUY at 55%+ confidence.
 
-RED FLAGS — auto SKIP if any:
-- Vol/MC ratio < 0.05 (weak volume relative to cap)
-- Buy ratio 5m < 1.8 (sellers catching up)
-- 1h price change > 120% (already pumped, likely to dump)
-- Liquidity < $40,000 (too risky, can't exit)
-- MC > $2.5M (too large for 20% gain quickly)
+Respond ONLY in this exact JSON:
+{{"decision": "BUY" or "SKIP", "confidence": 0-100, "reason": "one sentence"}}"""
 
-BE STRICT. A wrong trade loses 7%. Only BUY with 70%+ confidence in the momentum continuing.
 
-Respond ONLY in this exact JSON (no extra text):
-{{"decision": "BUY" or "SKIP", "confidence": 0-100, "reason": "one precise sentence with key metrics"}}"""
+def ask_ai_brain(token_data: dict) -> dict:
+    global _ai_down, _ai_down_notified
 
-    try:
-        headers = {
-            "Authorization": f"Bearer {GROQ_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": GROQ_MODEL,
-            "messages": [
-                {"role": "system", "content": "You are a strict crypto trading AI. Respond ONLY in valid JSON. Be conservative — only recommend BUY when confidence is very high."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.1,
-            "max_tokens": 200
-        }
-        resp = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=20
-        )
-        if resp.status_code == 200:
-            content = resp.json()["choices"][0]["message"]["content"].strip()
-            content = content.replace("```json", "").replace("```", "").strip()
-            result = json.loads(content)
-            return result
+    if not GROQ_SLOTS:
+        return _rule_based_fallback(token_data, notify=True)
+
+    prompt = _build_prompt(token_data)
+    payload_base = {
+        "messages": [
+            {"role": "system", "content": "You are a crypto trading AI. Respond ONLY in valid JSON."},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": 0.2,
+        "max_tokens": 200,
+    }
+
+    for idx, (api_key, model) in enumerate(GROQ_SLOTS):
+        try:
+            payload = {**payload_base, "model": model}
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=20,
+            )
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                content = content.replace("```json", "").replace("```", "").strip()
+                result = json.loads(content)
+                # AI recovered — notify once
+                if _ai_down:
+                    _ai_down = False
+                    _ai_down_notified = False
+                    key_num = GROQ_KEYS.index(api_key) + 1
+                    send_telegram(f"✅ <b>AI Brain BACK ONLINE</b>\nKey #{key_num} | Model: <code>{model}</code>")
+                print(f"[🤖 AI Key#{GROQ_KEYS.index(api_key)+1} {model}] {result.get('decision')} {result.get('confidence')}%")
+                return result
+            else:
+                err_body = resp.text[:120]
+                print(f"[Groq Slot {idx+1}] Error {resp.status_code} key#{GROQ_KEYS.index(api_key)+1} {model}: {err_body}")
+        except json.JSONDecodeError:
+            print(f"[Groq Slot {idx+1}] JSON parse error — {model}")
+        except Exception as e:
+            print(f"[Groq Slot {idx+1}] Exception {model}: {e}")
+
+    # All slots exhausted
+    _ai_down = True
+    return _rule_based_fallback(token_data, notify=True)
+
+
+def _rule_based_fallback(token_data: dict, notify: bool = False) -> dict:
+    """Rule-based decision when all Groq slots fail."""
+    global _ai_down_notified
+
+    br5m  = token_data.get("buy_ratio_5m", 0)
+    pc5m  = token_data.get("price_change_5m", 0)
+    pc1h  = token_data.get("price_change_1h", 0)
+    liq   = token_data.get("liquidity", 0)
+    vol5m = token_data.get("vol_5m", 0)
+    confs = token_data.get("confirmations_passed", 0)
+    sym   = token_data.get("symbol", "?")
+
+    # Hard rejects
+    if br5m < 1.0:
+        result = {"decision": "SKIP", "confidence": 0, "reason": f"[NoAI] Sellers dominating BR={br5m:.2f}"}
+    elif pc1h > 180:
+        result = {"decision": "SKIP", "confidence": 0, "reason": f"[NoAI] Overextended {pc1h:.0f}% in 1h"}
+    elif liq < 5000:
+        result = {"decision": "SKIP", "confidence": 0, "reason": f"[NoAI] Low liquidity ${liq:.0f}"}
+    else:
+        score = 0
+        if br5m >= 1.5:        score += 20
+        elif br5m >= 1.3:      score += 12
+        if 1 <= pc5m <= 40:    score += 20
+        elif pc5m > 0:         score += 10
+        if pc1h < 80:          score += 15
+        if liq >= 15000:       score += 15
+        elif liq >= 8000:      score += 8
+        if vol5m >= 3000:      score += 15
+        elif vol5m >= 1000:    score += 8
+        if confs >= 10:        score += 15
+        elif confs >= 8:       score += 10
+        confidence = min(score, 88)
+        if confidence >= 55:
+            result = {"decision": "BUY", "confidence": confidence,
+                      "reason": f"[NoAI] BR={br5m:.2f} PC5m={pc5m:.1f}% Liq=${liq:,.0f} {confs}/12"}
         else:
-            print(f"[Groq Error] {resp.status_code}: {resp.text[:200]}")
-            return {"decision": "SKIP", "confidence": 0, "reason": f"API error {resp.status_code}"}
-    except json.JSONDecodeError:
-        return {"decision": "SKIP", "confidence": 0, "reason": "AI JSON parse error"}
-    except Exception as e:
-        print(f"[Groq Exception] {e}")
-        return {"decision": "SKIP", "confidence": 0, "reason": str(e)}
+            result = {"decision": "SKIP", "confidence": confidence,
+                      "reason": f"[NoAI] Score too low {confidence}%"}
+
+    # Send one Telegram alert per outage
+    if notify and not _ai_down_notified:
+        _ai_down_notified = True
+        decision_icon = "🟡 Trading with rules" if result["decision"] == "BUY" else "⏸ Skipping token"
+        send_telegram(
+            f"⚠️ <b>AI Brain DOWN — All Groq APIs failed</b>\n"
+            f"Bot switching to <b>Rule-Based mode</b> automatically.\n"
+            f"{decision_icon}: <b>{sym}</b>\n"
+            f"Reason: {result['reason']}\n\n"
+            f"📌 {len(GROQ_SLOTS)} slots tried ({len(GROQ_KEYS)} keys × {len(GROQ_MODELS)} models)\n"
+            f"Bot will keep trading and auto-resume AI when available."
+        )
+    return result
 
 
 # ==================== SCANNING ====================
@@ -1018,7 +1090,7 @@ def analyze_pair(pair):
 
     print(f"[🤖 AI] {decision} | {confidence}% | {reason}")
 
-    if decision != "BUY" or confidence < 70:
+    if decision != "BUY" or confidence < 60:
         print(f"[Skip] AI rejected {symbol} ({confidence}%): {reason}")
         return None
 
@@ -1165,7 +1237,7 @@ def main_loop():
 
     print(f"[BOT START] Balance: ${balance_usd:.2f} | Target: ${TARGET_BALANCE_USD:.2f}")
     print(f"[CONFIG] TP: +{TP_PERCENT}% | SL: -{SL_PERCENT}% | Max Positions: {MAX_POSITIONS}")
-    print(f"[AI] Groq: {GROQ_MODEL} | Key: {'LOADED' if GROQ_API_KEY else 'MISSING'}")
+    print(f"[AI] Groq keys loaded: {len(GROQ_KEYS)} | Slots: {len(GROQ_SLOTS)} ({len(GROQ_KEYS)} keys × {len(GROQ_MODELS)} models)")
 
     t_cmd = threading.Thread(target=command_listener, daemon=True)
     t_cmd.start()
@@ -1176,15 +1248,22 @@ def main_loop():
 💰 Trade Size: FULL BALANCE | Max: {MAX_POSITIONS} position
 📈 TP: +{TP_PERCENT}% | 🛑 SL: -{SL_PERCENT}%
 🔍 Required: 8/12 checks + AI 70%+ confidence
-🤖 AI: Groq <b>{GROQ_MODEL}</b> (strict mode)
+🤖 AI: Groq <b>{len(GROQ_SLOTS)} slots</b> ({len(GROQ_KEYS)} keys × {len(GROQ_MODELS)} models)
 📡 Mode: PAPER TRADING (Demo)
 
 <b>Commands:</b> /status /balance /positions /history /pause /help
 ━━━━━━━━━━━━━━━━━━━━""")
 
     last_status_time = time.time()
+    last_seen_reset = time.time()
 
     while True:
+        # Reset seen_tokens every 30 min so previously skipped tokens can be re-evaluated
+        if time.time() - last_seen_reset >= 1800:
+            seen_tokens.clear()
+            last_seen_reset = time.time()
+            print("[Reset] seen_tokens cleared — fresh scan")
+
         if balance_usd >= TARGET_BALANCE_USD:
             send_telegram(f"🏆 <b>TARGET REACHED!</b> Balance: ${balance_usd:.2f} / Goal: ${TARGET_BALANCE_USD:.2f} | Trades: {len(trade_history)}")
             print(f"[🏆 GOAL REACHED] ${balance_usd:.2f}")
