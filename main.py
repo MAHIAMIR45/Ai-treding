@@ -60,11 +60,13 @@ PORT = int(os.environ.get("PORT", 5000))
 balance_usd = INITIAL_BALANCE_USD
 positions = {}
 trade_history = []
-seen_tokens = set()
+seen_tokens = set()          # resets every 30 min — within-session dedup
+traded_coins = set()         # PERMANENT — coins already traded, never re-buy
 start_time = datetime.now()
 bot_paused = False
 last_update_id = 0
 scan_count = 0
+NEW_COIN_MAX_AGE_HOURS = 4   # only buy coins launched within last 4 hours
 
 
 # ==================== FLASK WEB DASHBOARD ====================
@@ -253,6 +255,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .trade-detail { color: #718096; font-size: 0.7rem; margin-top: 2px; }
   .badge-tp { background: rgba(72,187,120,0.15); color: #48bb78; padding: 3px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; }
   .badge-sl { background: rgba(252,129,129,0.15); color: #fc8181; padding: 3px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; }
+  .badge-ai-exit { background: rgba(159,122,234,0.15); color: #b794f4; padding: 3px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: 700; }
   .trade-pnl { font-weight: 700; }
   .trade-pnl.pos { color: #48bb78; }
   .trade-pnl.neg { color: #fc8181; }
@@ -498,7 +501,26 @@ def api_status():
 
 
 def run_web():
-    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    import socket, os, signal
+    # Free the port if already in use (handles workflow restarts on Replit/Render)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", PORT))
+    except OSError:
+        # Port still locked — kill whoever owns it
+        try:
+            import subprocess
+            result = subprocess.check_output(["fuser", f"{PORT}/tcp"], stderr=subprocess.DEVNULL)
+            for pid in result.split():
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except:
+                    pass
+        except:
+            pass
+        import time as _t; _t.sleep(1)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
 
 
 # ==================== TELEGRAM ====================
@@ -750,10 +772,13 @@ _ai_down_notified = False
 
 
 def _build_prompt(token_data: dict) -> str:
+    age = token_data.get("pair_age_hours", 999)
+    age_str = f"{age:.1f}h old" if age < 999 else "age unknown"
+    age_note = "🆕 BRAND NEW COIN — high momentum potential" if age <= 4 else "older coin"
     return f"""You are an expert Solana meme coin trader. Analyze this token for a SHORT-TERM paper trade (TP +20%, SL -7%).
 
 TOKEN METRICS:
-- Symbol: {token_data.get('symbol')}
+- Symbol: {token_data.get('symbol')} ({age_str}) {age_note}
 - Price: ${token_data.get('price', 0):.10f}
 - Market Cap: ${token_data.get('mc', 0):,.0f}
 - Liquidity: ${token_data.get('liquidity', 0):,.0f}
@@ -767,9 +792,10 @@ TOKEN METRICS:
 - Mint Revoked: {token_data.get('mint_revoked', False)}
 - Confirmations: {token_data.get('confirmations_passed', 0)}/12
 
-BUY if: price moving up, buy ratio >= 1.3, MC < $5M, not already pumped >150% in 1h.
-SKIP if: sellers dominating (BR < 1.0), already pumped >180% in 1h, liquidity < $5K.
-This is paper trading — take calculated risks. Give BUY at 55%+ confidence.
+PRIORITY: New coins (<4h old) with strong buy pressure are the best candidates.
+BUY if: price moving up, buy ratio >= 1.3, MC < $5M, not already pumped >150% in 1h, LP locked or mint revoked.
+SKIP if: sellers dominating (BR < 1.0), already pumped >180% in 1h, liquidity < $5K, no safety signals.
+This is paper trading — take calculated risks on new coins. Give BUY at 55%+ confidence.
 
 Respond ONLY in this exact JSON:
 {{"decision": "BUY" or "SKIP", "confidence": 0-100, "reason": "one sentence"}}"""
@@ -901,10 +927,36 @@ def rugcheck_token(token_address):
     return {"lp_locked_pct": 0, "mint_revoked": False, "is_safe": False}
 
 
+def _pair_age_hours(pair: dict) -> float:
+    """Return pair age in hours from pairCreatedAt timestamp."""
+    created_at = pair.get("pairCreatedAt")
+    if not created_at:
+        return 999.0
+    try:
+        created_ts = int(created_at) / 1000  # ms → seconds
+        age_secs = time.time() - created_ts
+        return age_secs / 3600
+    except:
+        return 999.0
+
+
 def get_dexscreener_pairs():
-    all_pairs = []
+    new_pairs = []   # < 4 hours old — priority
+    old_pairs = []   # older — fallback
     seen_addrs = set()
 
+    def add_pair(p):
+        a = p.get("baseToken", {}).get("address")
+        if not a or a in seen_addrs:
+            return
+        seen_addrs.add(a)
+        age = _pair_age_hours(p)
+        if age <= NEW_COIN_MAX_AGE_HOURS:
+            new_pairs.append(p)
+        else:
+            old_pairs.append(p)
+
+    # Source 1 & 2: Boosted tokens (top + latest)
     for endpoint in [
         "https://api.dexscreener.com/token-boosts/top/v1",
         "https://api.dexscreener.com/token-boosts/latest/v1",
@@ -914,38 +966,47 @@ def get_dexscreener_pairs():
             if resp.status_code == 200:
                 boosted = resp.json() if isinstance(resp.json(), list) else []
                 sol_addrs = [b.get("tokenAddress") for b in boosted if b.get("chainId") == "solana"]
-                for addr in sol_addrs[:20]:
+                for addr in sol_addrs[:25]:
                     if addr:
                         try:
                             r2 = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=8)
-                            pairs = r2.json().get("pairs", [])
-                            for p in pairs:
-                                a = p.get("baseToken", {}).get("address")
-                                if a and a not in seen_addrs:
-                                    all_pairs.append(p)
-                                    seen_addrs.add(a)
+                            for p in r2.json().get("pairs", []):
+                                add_pair(p)
                         except:
                             pass
         except Exception as e:
-            print(f"[DexScreener Error] {e}")
+            print(f"[DexScreener Boost Error] {e}")
 
-    for query in ["SOL", "pump", "meme"]:
+    # Source 3: Latest token profiles — brand new launches
+    try:
+        resp = requests.get("https://api.dexscreener.com/token-profiles/latest/v1", timeout=12)
+        if resp.status_code == 200:
+            profiles = resp.json() if isinstance(resp.json(), list) else []
+            sol_addrs = [p.get("tokenAddress") for p in profiles if p.get("chainId") == "solana"]
+            for addr in sol_addrs[:30]:
+                if addr:
+                    try:
+                        r2 = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=8)
+                        for p in r2.json().get("pairs", []):
+                            add_pair(p)
+                    except:
+                        pass
+    except Exception as e:
+        print(f"[DexScreener Profiles Error] {e}")
+
+    # Source 4: Search queries
+    for query in ["SOL", "pump", "meme", "new"]:
         try:
-            resp = requests.get(
-                f"https://api.dexscreener.com/latest/dex/search?q={query}",
-                timeout=12
-            )
+            resp = requests.get(f"https://api.dexscreener.com/latest/dex/search?q={query}", timeout=12)
             if resp.status_code == 200:
-                pairs = resp.json().get("pairs", [])
-                for p in pairs:
-                    a = p.get("baseToken", {}).get("address")
-                    if a and a not in seen_addrs:
-                        all_pairs.append(p)
-                        seen_addrs.add(a)
+                for p in resp.json().get("pairs", []):
+                    add_pair(p)
         except Exception as e:
             print(f"[DexScreener Search Error q={query}] {e}")
 
-    print(f"[DexScreener] Total unique pairs fetched: {len(all_pairs)}")
+    # New coins first, then older ones
+    all_pairs = new_pairs + old_pairs
+    print(f"[DexScreener] {len(new_pairs)} NEW (<{NEW_COIN_MAX_AGE_HOURS}h) + {len(old_pairs)} older = {len(all_pairs)} total pairs")
     return all_pairs
 
 
@@ -1051,8 +1112,13 @@ def analyze_pair(pair):
         return None
 
     token_addr = base.get("address")
-    if not token_addr or token_addr in seen_tokens or token_addr in positions:
+    if not token_addr or token_addr in seen_tokens or token_addr in positions or token_addr in traded_coins:
         return None
+
+    # Age filter — only new coins (< 4 hours)
+    age_hours = _pair_age_hours(pair)
+    if age_hours > NEW_COIN_MAX_AGE_HOURS:
+        return None  # skip old coins silently
 
     try:
         liquidity = float(pair.get("liquidity", {}).get("usd") or 0)
@@ -1097,6 +1163,7 @@ def analyze_pair(pair):
     token_data["ai_confidence"] = confidence
     token_data["ai_reason"] = reason
     token_data["score"] = score
+    token_data["pair_age_hours"] = age_hours
     return token_data
 
 
@@ -1134,10 +1201,13 @@ def simulate_buy(token_data):
     }
 
     balance_usd -= amount_usd
+    traded_coins.add(token_addr)   # permanent — never re-buy this coin
+    seen_tokens.add(token_addr)
 
+    age_str = f"{token_data.get('pair_age_hours', 999):.1f}h" if token_data.get('pair_age_hours', 999) < 999 else "?"
     send_telegram(f"""🚀 <b>SIMULATED BUY EXECUTED</b>
 ━━━━━━━━━━━━━━━━━━━━
-🪙 Token: <b>{symbol}</b>
+🪙 Token: <b>{symbol}</b> (🆕 {age_str} old)
 🔗 <code>{token_addr}</code>
 
 💵 Entry Price: ${price_usd:.10f}
@@ -1155,19 +1225,98 @@ def simulate_buy(token_data):
 🔄 Buy Ratio: {token_data.get('buy_ratio_5m', 0):.2f}x
 ━━━━━━━━━━━━━━━━━━━━""")
 
-    print(f"[BUY] {symbol} @ ${price_usd:.10f} | ${amount_usd:.2f} full balance")
+    print(f"[BUY] {symbol} ({age_str} old) @ ${price_usd:.10f} | ${amount_usd:.2f} full balance")
     return True
 
 
-def check_positions():
-    global balance_usd
+def _ask_ai_exit(pos: dict, current_price: float, current_mc: float, pnl_percent: float) -> dict:
+    """Ask AI whether to exit early to cut losses."""
+    prompt = f"""You are managing an OPEN paper trade. Decide whether to EXIT now or HOLD.
 
+TRADE STATUS:
+- Token: {pos['symbol']}
+- Entry Price: ${pos['entry_price']:.10f}
+- Current Price: ${current_price:.10f}
+- Entry MC: ${pos.get('entry_mc', 0):,.0f}
+- Current MC: ${current_mc:,.0f}
+- Current PnL: {pnl_percent:+.2f}%
+- TP Target: +{TP_PERCENT}% | SL Hard Limit: -{SL_PERCENT}%
+- Time in trade: {int((datetime.now() - pos['entry_time']).total_seconds() / 60)} minutes
+
+RULES:
+- If momentum has clearly reversed and loss will deepen, EXIT now to save capital.
+- If this is a temporary dip and token still has potential, HOLD.
+- Prefer EXIT over riding a loss to the full -{SL_PERCENT}% SL.
+
+Respond ONLY in this exact JSON:
+{{"action": "EXIT" or "HOLD", "reason": "one sentence"}}"""
+
+    for api_key, model in GROQ_SLOTS:
+        try:
+            resp = requests.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": "You manage open trades. Respond ONLY in valid JSON."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 100,
+                },
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                content = content.replace("```json", "").replace("```", "").strip()
+                return json.loads(content)
+        except:
+            continue
+    # Fallback: exit if losing more than 4%
+    if pnl_percent < -4.0:
+        return {"action": "EXIT", "reason": "[NoAI] Loss > 4%, cutting early"}
+    return {"action": "HOLD", "reason": "[NoAI] No AI available, holding"}
+
+
+def _close_position(addr, pos, current_price, pnl_percent, pnl_usd, exit_value, result_label, reason=""):
+    global balance_usd
+    balance_usd += exit_value
+    trade_history.append({
+        "symbol": pos["symbol"],
+        "pnl_usd": pnl_usd,
+        "pnl_pct": pnl_percent,
+        "result": result_label,
+        "time": datetime.now(),
+    })
+    del positions[addr]
+
+    if result_label == "TP":
+        icon, title = "✅", "TAKE PROFIT HIT!"
+        pnl_str = f"+${pnl_usd:.2f} (+{pnl_percent:.1f}%)"
+    elif result_label == "AI-EXIT":
+        icon, title = "🤖", "AI EARLY EXIT"
+        pnl_str = f"${pnl_usd:.2f} ({pnl_percent:.1f}%)"
+    else:
+        icon, title = "❌", "STOP LOSS HIT"
+        pnl_str = f"${pnl_usd:.2f} ({pnl_percent:.1f}%)"
+
+    reason_line = f"\n💡 {reason}" if reason else ""
+    send_telegram(f"""{icon} <b>{title}</b>
+━━━━━━━━━━━━━━━━━━━━
+🪙 <b>{pos['symbol']}</b>
+📥 Entry: ${pos['entry_price']:.10f}
+📤 Exit:  ${current_price:.10f}
+📊 PnL: <b>{pnl_str}</b>{reason_line}
+💼 New Balance: <b>${balance_usd:.2f}</b>
+━━━━━━━━━━━━━━━━━━━━""")
+    print(f"[{result_label}] {pos['symbol']} {pnl_percent:+.1f}% | Balance: ${balance_usd:.2f}")
+
+
+def check_positions():
     for addr, pos in list(positions.items()):
         try:
-            resp = requests.get(
-                f"https://api.dexscreener.com/latest/dex/tokens/{addr}",
-                timeout=8
-            )
+            resp = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{addr}", timeout=8)
             data = resp.json()
             pairs = data.get("pairs", [])
             if not pairs:
@@ -1183,45 +1332,25 @@ def check_positions():
             positions[addr]["current_price"] = current_price
             positions[addr]["current_mc"] = current_mc
 
+            # TP hit
             if current_price >= pos["tp_price"]:
-                balance_usd += exit_value
-                trade_history.append({
-                    "symbol": pos["symbol"],
-                    "pnl_usd": pnl_usd,
-                    "pnl_pct": pnl_percent,
-                    "result": "TP",
-                    "time": datetime.now()
-                })
-                del positions[addr]
-                send_telegram(f"""✅ <b>TAKE PROFIT HIT!</b>
-━━━━━━━━━━━━━━━━━━━━
-🪙 <b>{pos['symbol']}</b>
-📥 Entry: ${pos['entry_price']:.10f}
-📤 Exit:  ${current_price:.10f}
-📈 PnL: <b>+${pnl_usd:.2f} (+{pnl_percent:.1f}%)</b>
-💼 New Balance: <b>${balance_usd:.2f}</b>
-━━━━━━━━━━━━━━━━━━━━""")
-                print(f"[TP] {pos['symbol']} +${pnl_usd:.2f} | Balance: ${balance_usd:.2f}")
+                _close_position(addr, pos, current_price, pnl_percent, pnl_usd, exit_value, "TP")
 
+            # Hard SL hit
             elif current_price <= pos["sl_price"]:
-                balance_usd += exit_value
-                trade_history.append({
-                    "symbol": pos["symbol"],
-                    "pnl_usd": pnl_usd,
-                    "pnl_pct": pnl_percent,
-                    "result": "SL",
-                    "time": datetime.now()
-                })
-                del positions[addr]
-                send_telegram(f"""❌ <b>STOP LOSS HIT</b>
-━━━━━━━━━━━━━━━━━━━━
-🪙 <b>{pos['symbol']}</b>
-📥 Entry: ${pos['entry_price']:.10f}
-📤 Exit:  ${current_price:.10f}
-📉 PnL: <b>${pnl_usd:.2f} ({pnl_percent:.1f}%)</b>
-💼 New Balance: <b>${balance_usd:.2f}</b>
-━━━━━━━━━━━━━━━━━━━━""")
-                print(f"[SL] {pos['symbol']} ${pnl_usd:.2f} | Balance: ${balance_usd:.2f}")
+                _close_position(addr, pos, current_price, pnl_percent, pnl_usd, exit_value, "SL")
+
+            # AI early exit check — triggers when loss > 3% (halfway to SL)
+            elif pnl_percent < -3.0:
+                print(f"[⚠️ Loss] {pos['symbol']} at {pnl_percent:.1f}% — asking AI whether to exit early...")
+                ai_exit = _ask_ai_exit(pos, current_price, current_mc, pnl_percent)
+                action = ai_exit.get("action", "HOLD")
+                reason = ai_exit.get("reason", "")
+                print(f"[AI Exit] {action} — {reason}")
+                if action == "EXIT":
+                    _close_position(addr, pos, current_price, pnl_percent, pnl_usd, exit_value, "AI-EXIT", reason)
+                else:
+                    print(f"[Hold] {pos['symbol']} | PnL: {pnl_percent:+.1f}% | AI: HOLD — {reason}")
 
             else:
                 print(f"[Hold] {pos['symbol']} | PnL: {pnl_percent:+.1f}% | MC: ${current_mc:,.0f}")
